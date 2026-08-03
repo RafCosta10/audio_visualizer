@@ -1,0 +1,16 @@
+# Rust build output
+/target/
+
+# Editor/IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

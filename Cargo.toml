@@ -1,0 +1,15 @@
+[package]
+name = "audio_visualizer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cpal = "0.18.1"
+eframe = "0.35.0"
+egui = "0.35.0"
+realfft = "3.5.0"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+mpris = "2.0"
+reqwest = { version = "0.13.4", features = ["blocking"] }
+base64 = "0.23.0"
+urlencoding = "2.1.3"
