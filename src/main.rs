@@ -1,12 +1,12 @@
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
+use egui::ecolor::Hsva;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
-use egui::ecolor::Hsva;
 use egui::{
-    epaint::Mesh, pos2, vec2, Align2, Color32, CornerRadius, FontId, Image, Rect, Shape, Stroke,
+    epaint::Mesh, pos2, vec2, Align2, Color32, CornerRadius, FontId, Rect, Shape, Stroke,
     TextureHandle, TextureOptions,
 };
 use realfft::num_complex::Complex;
@@ -20,21 +20,13 @@ const MIN_DB: f32 = -60.0;
 const MAX_DB: f32 = 0.0;
 const ALBUM_ART_SIZE: u32 = 160;
 
-// Bars never get thinner than this - below this width, adjacent bars are
-// merged (max-pooled) so the spectrum degrades to fewer, chunkier bars
-// instead of vanishing.
 const MIN_BAR_WIDTH: f32 = 4.0;
 const BAR_GAP: f32 = 3.0;
-const MIN_SPECTRUM_HEIGHT: f32 = 60.0;
+const MIN_SPECTRUM_HEIGHT: f32 = 80.0;
 
-// Smoothing rates, in units of "per second" so motion looks the same
-// regardless of frame rate. Attack is fast (bars jump up to catch transients),
-// release is slightly slower (bars ease down instead of snapping), and the
-// peak markers fall slower still so they're readable as a hold indicator.
-// Rule of thumb: time to reach ~95% of a new value ≈ 3 / rate (seconds).
-const ATTACK_RATE: f32 = 45.0; // ~0.07s to catch a rising value
-const RELEASE_RATE: f32 = 16.0; // ~0.19s to ease back down
-const PEAK_RELEASE_RATE: f32 = 2.2; // ~1.4s peak hold decay
+const ATTACK_RATE: f32 = 45.0; // ~0.07s to catch a rising value[cite: 1]
+const RELEASE_RATE: f32 = 16.0; // ~0.19s to ease back down[cite: 1]
+const PEAK_RELEASE_RATE: f32 = 2.2; // ~1.4s peak hold decay[cite: 1]
 
 type BarFrame = [f32; NUM_BARS];
 
@@ -43,6 +35,113 @@ struct TrackUpdate {
     artist: String,
     album: String,
     art: Option<egui::ColorImage>,
+}
+
+struct PlaybackUpdate {
+    is_playing: bool,
+    position: Duration,
+    length: Option<Duration>,
+}
+
+enum MprisMessage {
+    Track(TrackUpdate),
+    Playback(PlaybackUpdate),
+}
+
+// Add this anywhere above your VisualizerApp struct:
+#[derive(Clone, Copy)]
+struct AppPalette {
+    bg_top: Color32,
+    bg_bottom: Color32,
+    panel_bg: Color32,
+    panel_border: Color32,
+    button_rest: Color32,
+    button_hover: Color32,
+    button_click: Color32,
+    text_muted: Color32,
+    text_primary: Color32,
+    text_accent: Color32,
+    led_low: Color32,
+    led_mid: Color32,
+    led_high: Color32,
+    record_label: Color32,
+}
+
+impl Default for AppPalette {
+    fn default() -> Self {
+        // Your Cool Blue & Silver theme
+        Self {
+            bg_top: Color32::from_rgb(42, 45, 52),
+            bg_bottom: Color32::from_rgb(27, 28, 32),
+            panel_bg: Color32::from_rgb(34, 37, 42),
+            panel_border: Color32::from_rgb(110, 115, 125),
+            button_rest: Color32::from_rgb(45, 50, 60),
+            button_hover: Color32::from_rgb(55, 65, 80),
+            button_click: Color32::from_rgb(35, 40, 50),
+            text_muted: Color32::from_rgb(150, 160, 175),
+            text_primary: Color32::from_rgb(230, 240, 248),
+            text_accent: Color32::from_rgb(75, 163, 195),
+            led_low: Color32::from_rgb(23, 86, 118),
+            led_mid: Color32::from_rgb(75, 163, 195),
+            led_high: Color32::from_rgb(204, 230, 244),
+            record_label: Color32::from_rgb(29, 47, 111),
+        }
+    }
+}
+
+impl AppPalette {
+    fn from_image(img: &egui::ColorImage) -> Self {
+        let mut r_sum = 0.0; let mut g_sum = 0.0; let mut b_sum = 0.0; let mut count = 0.0;
+        let mut r_fall = 0.0; let mut g_fall = 0.0; let mut b_fall = 0.0; let mut fall_count = 0.0;
+
+        // Sample the image pixels to find a dominant color
+        for p in &img.pixels {
+            let r = p.r() as f32; let g = p.g() as f32; let b = p.b() as f32;
+            let hsva = Hsva::from(*p);
+
+            // Prioritize colors that are reasonably saturated and not too dark/light
+            if hsva.v > 0.2 && hsva.v < 0.8 && hsva.s > 0.3 {
+                r_sum += r; g_sum += g; b_sum += b; count += 1.0;
+            }
+            r_fall += r; g_fall += g; b_fall += b; fall_count += 1.0;
+        }
+
+        let avg_color = if count > 0.0 {
+            Color32::from_rgb((r_sum / count) as u8, (g_sum / count) as u8, (b_sum / count) as u8)
+        } else if fall_count > 0.0 {
+            Color32::from_rgb((r_fall / fall_count) as u8, (g_fall / fall_count) as u8, (b_fall / fall_count) as u8)
+        } else {
+            return Self::default();
+        };
+
+        let base_hsva = Hsva::from(avg_color);
+        let h = base_hsva.h;
+        let s = base_hsva.s.max(0.15); // Ensure at least a slight tint
+
+        // Mathematically derive the UI colors from the dominant hue
+        Self {
+            bg_top: Hsva::new(h, s * 0.3, 0.22, 1.0).into(),
+            bg_bottom: Hsva::new(h, s * 0.3, 0.12, 1.0).into(),
+            panel_bg: Hsva::new(h, s * 0.2, 0.16, 1.0).into(),
+            panel_border: Hsva::new(h, s * 0.15, 0.45, 1.0).into(),
+            button_rest: Hsva::new(h, s * 0.2, 0.22, 1.0).into(),
+            button_hover: Hsva::new(h, s * 0.2, 0.30, 1.0).into(),
+            button_click: Hsva::new(h, s * 0.2, 0.15, 1.0).into(),
+            text_muted: Hsva::new(h, s * 0.1, 0.65, 1.0).into(),
+            text_primary: Hsva::new(h, s * 0.05, 0.95, 1.0).into(),
+            text_accent: Hsva::new(h, (s * 1.5).min(1.0), 0.75, 1.0).into(),
+            led_low: Hsva::new(h, s, 0.4, 1.0).into(),
+            led_mid: Hsva::new(h, (s * 1.5).min(1.0), 0.75, 1.0).into(),
+            led_high: Hsva::new(h, s * 0.5, 0.95, 1.0).into(),
+            record_label: Hsva::new(h, s, 0.3, 1.0).into(),
+        }
+    }
+}
+
+// Helper for the progress bar text
+fn format_time(d: Duration) -> String {
+    let secs = d.as_secs();
+    format!("{}:{:02}", secs / 60, secs % 60)
 }
 
 fn bin_to_bar(bin: usize) -> usize {
@@ -70,18 +169,11 @@ fn compute_bars(spectrum: &[Complex<f32>]) -> BarFrame {
     bars
 }
 
-/// Exponential smoothing that behaves the same regardless of frame rate:
-/// `rate` is a "per second" speed, so a slow frame and several fast frames
-/// covering the same wall-clock time land on (almost) the same value.
 fn exponential_smooth(current: f32, target: f32, rate: f32, dt: f32) -> f32 {
     let alpha = 1.0 - (-rate * dt).exp();
     current + (target - current) * alpha
 }
 
-/// Move `current` toward `target`, using a fast attack when the signal is
-/// rising and a slower release when it's falling. This is what makes the
-/// bars feel punchy on transients but calm on decay, instead of snapping
-/// instantly in both directions.
 fn update_bars(current: &mut BarFrame, target: &BarFrame, attack_rate: f32, release_rate: f32, dt: f32) {
     for (c, &t) in current.iter_mut().zip(target.iter()) {
         let rate = if t > *c { attack_rate } else { release_rate };
@@ -89,9 +181,6 @@ fn update_bars(current: &mut BarFrame, target: &BarFrame, attack_rate: f32, rele
     }
 }
 
-/// Max-pool the fixed NUM_BARS-wide FFT data down to `display_count` bars.
-/// Using max (rather than average) keeps transients visible even when
-/// several source bins get merged into one displayed bar.
 fn downsample_bars(bars: &BarFrame, display_count: usize) -> Vec<f32> {
     let n = bars.len();
     if display_count >= n {
@@ -191,51 +280,53 @@ fn load_album_art(uri: &str) -> Option<egui::ColorImage> {
     ))
 }
 
-fn spawn_mpris_thread(tx_meta: mpsc::Sender<TrackUpdate>) {
+fn spawn_mpris_thread(tx_mpris: mpsc::Sender<MprisMessage>) {
     thread::spawn(move || {
         let mut last_id: Option<String> = None;
-        loop {
-            if let Ok(finder) = mpris::PlayerFinder::new() {
+        if let Ok(finder) = mpris::PlayerFinder::new() {
+            loop {
                 if let Ok(player) = finder.find_active() {
-                    if let Ok(metadata) = player.get_metadata() {
-                        let id = metadata
-                        .track_id()
-                        .map(|id| id.to_string())
-                        .unwrap_or_else(|| {
+                    // 1. Send Playback State (Position, Status, Length)
+                    let status = player.get_playback_status().unwrap_or(mpris::PlaybackStatus::Stopped);
+                    let is_playing = status == mpris::PlaybackStatus::Playing;
+                    let position = player.get_position().unwrap_or_default();
+
+                    let metadata = player.get_metadata().ok();
+                    let length = metadata.as_ref().and_then(|m| m.length());
+
+                    tx_mpris.send(MprisMessage::Playback(PlaybackUpdate {
+                        is_playing, position, length
+                    })).ok();
+
+                    // 2. Send Track Data if the song changed
+                    if let Some(metadata) = metadata {
+                        let id = metadata.track_id().map(|id| id.to_string()).unwrap_or_else(|| {
                             format!("{:?}{:?}", metadata.title(), metadata.artists())
                         });
 
                         if last_id.as_deref() != Some(id.as_str()) {
                             last_id = Some(id);
-
                             let title = metadata.title().unwrap_or("Unknown title").to_string();
-                            let artist = metadata
-                            .artists()
-                            .map(|a| a.join(", "))
-                            .unwrap_or_else(|| "Unknown artist".to_string());
+                            let artist = metadata.artists().map(|a| a.join(", ")).unwrap_or_else(|| "Unknown artist".to_string());
                             let album = metadata.album_name().unwrap_or("").to_string();
                             let art = metadata.art_url().and_then(load_album_art);
 
-                            tx_meta
-                            .send(TrackUpdate {
-                                title,
-                                artist,
-                                album,
-                                art,
-                            })
-                            .ok();
+                            tx_mpris.send(MprisMessage::Track(TrackUpdate {
+                                title, artist, album, art
+                            })).ok();
                         }
                     }
                 }
+                // Fast poll for smooth progress bar updates
+                thread::sleep(Duration::from_millis(100));
             }
-            thread::sleep(Duration::from_millis(800));
         }
     });
 }
 
 struct VisualizerApp {
     rx_gui: mpsc::Receiver<BarFrame>,
-    rx_meta: mpsc::Receiver<TrackUpdate>,
+    rx_mpris: mpsc::Receiver<MprisMessage>, // Renamed from rx_meta
     current_bars: BarFrame,
     peak_bars: BarFrame,
     attack_rate: f32,
@@ -245,95 +336,231 @@ struct VisualizerApp {
     title: String,
     artist: String,
     album: String,
+    record_angle: f32,
+    text_scroll: f32,
+    is_playing: bool,            // NEW
+    position: Duration,          // NEW
+    length: Option<Duration>,    // NEW
+    current_palette: AppPalette,
 }
 
 fn with_alpha(color: Color32, alpha: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
 }
 
-fn paint_gradient_background(painter: &egui::Painter, rect: Rect, top: Color32, bottom: Color32) {
+fn paint_dynamic_gradient_background(painter: &egui::Painter, rect: Rect, palette: &AppPalette) {
     let mut mesh = Mesh::default();
-    mesh.colored_vertex(rect.left_top(), top);
-    mesh.colored_vertex(rect.right_top(), top);
-    mesh.colored_vertex(rect.left_bottom(), bottom);
-    mesh.colored_vertex(rect.right_bottom(), bottom);
+    mesh.colored_vertex(rect.left_top(), palette.bg_top);
+    mesh.colored_vertex(rect.right_top(), palette.bg_top);
+    mesh.colored_vertex(rect.left_bottom(), palette.bg_bottom);
+    mesh.colored_vertex(rect.right_bottom(), palette.bg_bottom);
     mesh.add_triangle(0, 1, 2);
     mesh.add_triangle(1, 2, 3);
     painter.add(Shape::mesh(mesh));
 }
 
+fn draw_hardware_button(ui: &mut egui::Ui, text: &str, palette: &AppPalette) -> egui::Response {
+    let size = vec2(46.0, 28.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let painter = ui.painter();
+
+    let is_clicked = response.is_pointer_button_down_on();
+    let is_hovered = response.hovered();
+
+    let bg_color = if is_clicked {
+        palette.button_click
+    } else if is_hovered {
+        palette.button_hover
+    } else {
+        palette.button_rest
+    };
+
+    painter.rect_filled(rect, CornerRadius::same(3), bg_color);
+    painter.rect_stroke(rect, CornerRadius::same(3), Stroke::new(1.0, palette.panel_border), egui::StrokeKind::Inside);
+
+    let text_color = if is_clicked { palette.text_primary } else { palette.text_accent };
+
+    painter.text(rect.center(), Align2::CENTER_CENTER, text, FontId::proportional(16.0), text_color);
+    response
+}
+
+fn draw_marquee_text(ui: &mut egui::Ui, text: &str, font: FontId, color: Color32, offset: f32, max_width: f32) {
+    // FIX: Lay out the text first without holding onto `painter`
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font, color);
+    let text_width = galley.rect.width();
+
+    // Safely allocate size (mutable borrow)
+    let (rect, _) = ui.allocate_exact_size(vec2(max_width, galley.rect.height()), egui::Sense::hover());
+
+    // Grab the painter (immutable borrow) now that we're done mutating `ui`
+    let painter = ui.painter();
+
+    if text_width <= max_width {
+        painter.galley(rect.left_top(), galley, color);
+    } else {
+        let scroll_max = text_width + 40.0;
+        let current_offset = offset % scroll_max;
+
+        painter.with_clip_rect(rect).galley(rect.left_top() - vec2(current_offset, 0.0), galley.clone(), color);
+
+        if current_offset > (text_width + 40.0 - max_width) {
+            painter.with_clip_rect(rect).galley(rect.left_top() + vec2(scroll_max - current_offset, 0.0), galley, color);
+        }
+    }
+}
+
 impl VisualizerApp {
     fn draw_now_playing(&self, ui: &mut egui::Ui) {
-        // Scale the art and type down at narrow widths instead of letting
-        // them overflow the window or get clipped.
-        let available_width = ui.available_width();
-        let compact = available_width < 380.0;
-        let art_px = if compact { 64.0 } else { 96.0 };
-        let title_size = if compact { 18.0 } else { 22.0 };
-
         ui.horizontal(|ui| {
-            let art_size = vec2(art_px, art_px);
+            // -- The Sleeve and Spinning Vinyl --
+            let sleeve_size = 140.0;
+            let record_radius = sleeve_size / 2.0;
+            let protruding_amount = record_radius * 0.85;
+
+            let (rect, _) = ui.allocate_exact_size(vec2(sleeve_size + protruding_amount, sleeve_size), egui::Sense::hover());
+            let painter = ui.painter();
+
+            let sleeve_rect = Rect::from_min_size(rect.left_top(), vec2(sleeve_size, sleeve_size));
+            let record_center = pos2(sleeve_rect.right() - record_radius + protruding_amount, sleeve_rect.center().y);
+
+            // 1. Draw the Spinning Vinyl (underneath the sleeve)
+            painter.circle_filled(record_center, record_radius, Color32::from_rgb(18, 18, 18));
+            painter.circle_stroke(record_center, record_radius * 0.85, Stroke::new(1.0, Color32::from_rgb(35, 35, 35)));
+            painter.circle_stroke(record_center, record_radius * 0.70, Stroke::new(1.0, Color32::from_rgb(25, 25, 25)));
+            painter.circle_stroke(record_center, record_radius * 0.55, Stroke::new(1.0, Color32::from_rgb(35, 35, 35)));
+
+            // Dynamic center label
+            let label_radius = record_radius * 0.42;
+            painter.circle_filled(record_center, label_radius, self.current_palette.record_label);
+
+            let rot_dir = vec2(self.record_angle.cos(), self.record_angle.sin());
+            let marker_color = self.current_palette.text_primary;
+
+            // Inner ring
+            painter.circle_stroke(record_center, label_radius * 0.8, Stroke::new(1.0, marker_color));
+
+            // Markers
+            let dot_pos = record_center + rot_dir * (label_radius * 0.5);
+            painter.circle_filled(dot_pos, label_radius * 0.15, marker_color);
+
+            let line_start = record_center - rot_dir * (label_radius * 0.8);
+            let line_end = record_center - rot_dir * (label_radius * 0.3);
+            painter.line_segment([line_start, line_end], Stroke::new(3.0, marker_color));
+
+            // Spindle hole
+            painter.circle_filled(record_center, 4.0, Color32::from_rgb(20, 20, 20));
+
+            // 2. Draw the Album Sleeve (on top)
+            painter.rect_filled(sleeve_rect, CornerRadius::same(4), self.current_palette.bg_bottom);
+
             if let Some(tex) = &self.album_art {
-                ui.add(Image::new(tex).fit_to_exact_size(art_size));
+                painter.image(
+                    tex.id(),
+                              sleeve_rect,
+                              Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                              Color32::WHITE
+                );
             } else {
-                let (rect, _) = ui.allocate_exact_size(art_size, egui::Sense::hover());
-                ui.painter()
-                .rect_filled(rect, CornerRadius::same(10), Color32::from_rgb(38, 38, 52));
-                ui.painter().text(
-                    rect.center(),
-                                  Align2::CENTER_CENTER,
-                                  "\u{266A}",
-                                  FontId::proportional(art_px * 0.35),
-                                  Color32::from_rgb(120, 120, 150),
+                painter.text(
+                    sleeve_rect.center(),
+                             Align2::CENTER_CENTER,
+                             "\u{266A}",
+                             FontId::proportional(60.0),
+                             self.current_palette.text_muted,
                 );
             }
 
-            ui.add_space(if compact { 10.0 } else { 16.0 });
+            // Dynamic inner shadow/border
+            painter.rect_stroke(sleeve_rect, CornerRadius::same(4), Stroke::new(1.0, self.current_palette.panel_border), egui::StrokeKind::Inside);
+
+            ui.add_space(24.0);
+
+            // -- Metadata & Controls --
             ui.vertical(|ui| {
-                ui.add_space(6.0);
-                let title = if self.title.is_empty() {
-                    "Nothing playing"
-                } else {
-                    &self.title
-                };
-                // truncate() keeps long metadata from a track's title/artist/
-                // album pushing the window wider or overflowing the layout;
-                // it ellipsizes instead.
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(title)
-                        .size(title_size)
-                        .strong()
-                        .color(Color32::WHITE),
-                    )
-                    .truncate(),
+                ui.add_space(16.0);
+
+                ui.label(egui::RichText::new("NOW PLAYING")
+                .size(11.0)
+                .monospace()
+                .color(self.current_palette.text_muted));
+
+                let title = if self.title.is_empty() { "NOTHING PLAYING" } else { &self.title };
+                let available_text_width = ui.available_width() - 20.0;
+
+                draw_marquee_text(
+                    ui,
+                    &title.to_uppercase(),
+                                  FontId::monospace(22.0),
+                                  self.current_palette.text_primary,
+                                  self.text_scroll,
+                                  available_text_width
                 );
+
+                ui.add_space(4.0);
+
                 if !self.artist.is_empty() {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(&self.artist)
-                            .size(15.0)
-                            .color(Color32::from_rgb(170, 170, 190)),
-                        )
-                        .truncate(),
+                    draw_marquee_text(
+                        ui,
+                        &self.artist.to_uppercase(),
+                                      FontId::monospace(14.0),
+                                      self.current_palette.text_accent,
+                                      self.text_scroll * 0.7,
+                                      available_text_width
                     );
                 }
-                if !self.album.is_empty() && !compact {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(&self.album)
-                            .size(13.0)
-                            .italics()
-                            .color(Color32::from_rgb(120, 120, 145)),
-                        )
-                        .truncate(),
+                if !self.album.is_empty() {
+                    draw_marquee_text(
+                        ui,
+                        &self.album.to_uppercase(),
+                                      FontId::monospace(12.0),
+                                      self.current_palette.text_muted,
+                                      self.text_scroll * 0.5,
+                                      available_text_width
                     );
                 }
 
                 ui.add_space(8.0);
+
+                // --- Retro Progress Bar ---
+                let progress_rect_height = 16.0;
+                let (prog_rect, _) = ui.allocate_exact_size(vec2(available_text_width, progress_rect_height), egui::Sense::hover());
+                let prog_painter = ui.painter(); // Safely grab a painter for the progress bar
+
+                let time_str = format_time(self.position);
+                let rem_str = if let Some(len) = self.length {
+                    let rem = len.saturating_sub(self.position);
+                    format!("-{}", format_time(rem))
+                } else {
+                    "--:--".to_string()
+                };
+
+                prog_painter.text(prog_rect.left_center(), Align2::LEFT_CENTER, time_str, FontId::monospace(11.0), self.current_palette.text_muted);
+                prog_painter.text(prog_rect.right_center(), Align2::RIGHT_CENTER, rem_str, FontId::monospace(11.0), self.current_palette.text_muted);
+
+                let bar_left = prog_rect.left() + 38.0;
+                let bar_right = prog_rect.right() - 42.0;
+                let bar_y = prog_rect.center().y;
+
+                // Background Track
+                prog_painter.line_segment([pos2(bar_left, bar_y), pos2(bar_right, bar_y)], Stroke::new(2.0, self.current_palette.button_rest));
+
+                // Active Track & Playhead
+                if let Some(len) = self.length {
+                    if len.as_secs_f32() > 0.0 {
+                        let ratio = (self.position.as_secs_f32() / len.as_secs_f32()).clamp(0.0, 1.0);
+                        let playhead_x = bar_left + (bar_right - bar_left) * ratio;
+
+                        prog_painter.line_segment([pos2(bar_left, bar_y), pos2(playhead_x, bar_y)], Stroke::new(2.0, self.current_palette.text_accent));
+                        prog_painter.circle_filled(pos2(playhead_x, bar_y), 3.5, self.current_palette.text_primary);
+                    }
+                }
+
+                ui.add_space(12.0);
+
+                // -- Physical Custom Buttons --
                 ui.horizontal(|ui| {
-                    if ui.button("⏮").clicked() {
-                        thread::spawn(|| {
+                    if draw_hardware_button(ui, "⏮", &self.current_palette).clicked() {
+                        std::thread::spawn(|| {
                             if let Ok(finder) = mpris::PlayerFinder::new() {
                                 if let Ok(player) = finder.find_active() {
                                     player.previous().ok();
@@ -341,8 +568,8 @@ impl VisualizerApp {
                             }
                         });
                     }
-                    if ui.button("⏵⏸").clicked() {
-                        thread::spawn(|| {
+                    if draw_hardware_button(ui, "⏵⏸", &self.current_palette).clicked() {
+                        std::thread::spawn(|| {
                             if let Ok(finder) = mpris::PlayerFinder::new() {
                                 if let Ok(player) = finder.find_active() {
                                     player.play_pause().ok();
@@ -350,8 +577,8 @@ impl VisualizerApp {
                             }
                         });
                     }
-                    if ui.button("⏭").clicked() {
-                        thread::spawn(|| {
+                    if draw_hardware_button(ui, "⏭", &self.current_palette).clicked() {
+                        std::thread::spawn(|| {
                             if let Ok(finder) = mpris::PlayerFinder::new() {
                                 if let Ok(player) = finder.find_active() {
                                     player.next().ok();
@@ -365,90 +592,75 @@ impl VisualizerApp {
     }
 
     fn draw_spectrum(&self, ui: &mut egui::Ui, height: f32) {
+        // These were the missing setup lines!
         let desired_size = vec2(ui.available_width(), height.max(MIN_SPECTRUM_HEIGHT));
         let (rect, _) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
         let painter = ui.painter();
 
-        // Figure out how many bars actually fit at a legible width, and
-        // merge the full-resolution FFT data down to that count. This is
-        // what keeps bars visible (instead of shrinking to nothing) as the
-        // window gets narrower - fewer, wider bars rather than 32 hairlines.
         let available_width = rect.width().max(1.0);
-        let max_bars_that_fit =
-        (((available_width + BAR_GAP) / (MIN_BAR_WIDTH + BAR_GAP)).floor() as usize).max(1);
+        let max_bars_that_fit = (((available_width + BAR_GAP) / (MIN_BAR_WIDTH + BAR_GAP)).floor() as usize).max(1);
         let n = max_bars_that_fit.min(self.current_bars.len());
 
         let values = downsample_bars(&self.current_bars, n);
         let peaks = downsample_bars(&self.peak_bars, n);
 
-        let gap = BAR_GAP;
-        let bar_width = ((available_width - gap * (n as f32 - 1.0)) / n as f32).max(1.0);
-        let baseline = rect.bottom();
+        let bar_width = ((available_width - BAR_GAP * (n as f32 - 1.0)) / n as f32).max(1.0);
 
-        for (i, (&value, &peak)) in values
-            .iter()
-            .zip(peaks.iter())
-            .enumerate()
-            {
-                let x = rect.left() + i as f32 * (bar_width + gap);
-                let height = (value * rect.height()).clamp(0.0, rect.height());
-                let bar_rect =
-                Rect::from_min_max(pos2(x, baseline - height), pos2(x + bar_width, baseline));
+        // --- Dynamic Vertical Scaling ---
+        let segment_gap = 2.0;
+        let desired_segment_height = (bar_width * 0.5).clamp(4.0, 12.0);
+        let segments = ((rect.height() + segment_gap) / (desired_segment_height + segment_gap)).floor() as usize;
+        let segments = segments.clamp(6, 64);
+        let segment_height = (rect.height() - (segments - 1) as f32 * segment_gap) / segments as f32;
 
-                let hue = 0.55 + (i as f32 / n as f32) * 0.30;
-                let brightness = 0.45 + value.clamp(0.0, 1.0) * 0.55;
-                let color: Color32 = Hsva::new(hue, 0.75, brightness, 1.0).into();
+        for (i, (&value, &peak)) in values.iter().zip(peaks.iter()).enumerate() {
+            let x = rect.left() + i as f32 * (bar_width + BAR_GAP);
 
-                for (expand, alpha) in [(8.0, 10u8), (4.0, 18u8)] {
-                    let glow_rect = bar_rect.expand(expand);
-                    painter.rect_filled(
-                        glow_rect,
-                        CornerRadius::same(((bar_width * 0.5 + expand) as u8).max(1)),
-                                        with_alpha(color, alpha),
-                    );
+            let active_segments = (value * segments as f32).round() as usize;
+            let peak_segment = (peak * segments as f32).round() as usize;
+
+            for s in 0..segments {
+                let y = rect.bottom() - (s as f32 + 1.0) * segment_height - s as f32 * segment_gap;
+                let seg_rect = Rect::from_min_max(pos2(x, y), pos2(x + bar_width, y + segment_height));
+
+                let is_active = s < active_segments;
+                let is_peak = s == peak_segment;
+
+                // Dynamically map colors based on the total number of segments
+                let base_color = if s < (segments / 2) {
+                    self.current_palette.led_low
+                } else if s < (segments * 4 / 5) {
+                    self.current_palette.led_mid
+                } else {
+                    self.current_palette.led_high
+                };
+
+                let color = if is_active || is_peak {
+                    base_color
+                } else {
+                    base_color.linear_multiply(0.12) // Dim inactive LED
+                };
+
+                painter.rect_filled(seg_rect, CornerRadius::same(1), color);
+
+                if is_active {
+                    painter.rect_filled(seg_rect.expand(2.5), CornerRadius::same(2), with_alpha(base_color, 25));
                 }
-
-                painter.rect_filled(
-                    bar_rect,
-                    CornerRadius::same(((bar_width * 0.4) as u8).max(1)),
-                                    color,
-                );
-
-                let reflection_height = height * 0.3;
-                if reflection_height > 1.0 {
-                    let reflection_rect = Rect::from_min_max(
-                        pos2(x, baseline),
-                                                             pos2(x + bar_width, baseline + reflection_height),
-                    );
-                    painter.rect_filled(
-                        reflection_rect,
-                        CornerRadius::same(((bar_width * 0.3) as u8).max(1)),
-                                        with_alpha(color, 40),
-                    );
-                }
-
-                let peak_height = (peak * rect.height()).clamp(0.0, rect.height());
-                let peak_y = baseline - peak_height;
-                painter.line_segment(
-                    [pos2(x, peak_y), pos2(x + bar_width, peak_y)],
-                                     Stroke::new(2.0, Color32::WHITE.gamma_multiply(0.8)),
-                );
             }
+        }
     }
 }
 
 impl eframe::App for VisualizerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // Real elapsed time since the last frame - repaint is requested
-        // unconditionally below, so frame rate can vary a lot; smoothing by
-        // dt instead of by a fixed per-frame factor keeps bar motion looking
-        // the same regardless of how fast the display is repainting.
         let dt = ui.input(|i| i.stable_dt).clamp(1.0 / 240.0, 0.1);
 
-        // The audio thread can push several FFT frames per GUI repaint;
-        // only the newest one matters as this frame's target, so drain the
-        // channel and smooth toward that once rather than once per message
-        // (which would make bars decay faster whenever a backlog builds up).
+        // ONLY spin and scroll if the music is actively playing
+        if self.is_playing {
+            self.record_angle += dt * 1.8;
+            self.text_scroll += dt * 35.0;
+        }
+
         let mut latest_bars = None;
         while let Ok(target_bars) = self.rx_gui.try_recv() {
             latest_bars = Some(target_bars);
@@ -467,40 +679,79 @@ impl eframe::App for VisualizerApp {
             *peak = current.max(decayed);
         }
 
-        while let Ok(update) = self.rx_meta.try_recv() {
-            self.title = update.title;
-            self.artist = update.artist;
-            self.album = update.album;
-            self.album_art = update.art.map(|color_image| {
-                ui.ctx().load_texture(
-                    "album_art",
-                    color_image,
-                    TextureOptions::LINEAR,
-                )
-            });
+        while let Ok(msg) = self.rx_mpris.try_recv() {
+            match msg {
+                MprisMessage::Track(update) => {
+                    self.title = update.title;
+                    self.artist = update.artist;
+                    self.album = update.album;
+
+                    // Generate the palette right before converting to a texture!
+                    if let Some(img) = &update.art {
+                        self.current_palette = AppPalette::from_image(img);
+                    } else {
+                        self.current_palette = AppPalette::default();
+                    }
+
+                    self.album_art = update.art.map(|color_image| {
+                        ui.ctx().load_texture(
+                            "album_art",
+                            color_image,
+                            TextureOptions::LINEAR,
+                        )
+                    });
+                    self.text_scroll = 0.0;
+                }
+                MprisMessage::Playback(update) => {
+                    self.is_playing = update.is_playing;
+                    self.position = update.position;
+                    self.length = update.length;
+                }
+            }
         }
 
-        // Subtle top-to-bottom gradient reads as less flat/static than a
-        // solid fill, especially behind the bar glow effects.
-        paint_gradient_background(
-            ui.painter(),
-                                  ui.max_rect(),
-                                  Color32::from_rgb(16, 16, 26),
-                                  Color32::from_rgb(9, 9, 15),
-        );
+        paint_dynamic_gradient_background(ui.painter(), ui.max_rect(), &self.current_palette);
 
-        let background = egui::Frame::default().inner_margin(egui::Margin::same(24));
+        let outer_margin = egui::Margin::same(24);
+        let background = egui::Frame::default().inner_margin(outer_margin);
 
         background.show(ui, |ui| {
-            ui.heading(egui::RichText::new("Audio Visualizer").color(Color32::WHITE));
-            ui.add_space(16.0);
-            self.draw_now_playing(ui);
-            ui.add_space(24.0);
-            // Whatever vertical space is left (rather than a hardcoded
-            // height) so the spectrum actually grows/shrinks when the
-            // window is resized taller or shorter.
-            let remaining_height = ui.available_height();
-            self.draw_spectrum(ui, remaining_height);
+            // Draw brushed inner panel container (Steely gray)
+            let panel_rect = ui.available_rect_before_wrap();
+            ui.painter().rect_filled(panel_rect, CornerRadius::same(6), self.current_palette.panel_bg);
+            ui.painter().rect_stroke(panel_rect, CornerRadius::same(6), Stroke::new(1.0, self.current_palette.panel_border), egui::StrokeKind::Inside);
+
+            // Inner margin for content inside the metal panel
+            egui::Frame::default().inner_margin(egui::Margin::same(20)).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("STEREO VISUALIZER").color(self.current_palette.text_primary).monospace().size(16.0).strong());
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Power Light LED (Cyan)
+                        let (rect, _) = ui.allocate_exact_size(vec2(12.0, 12.0), egui::Sense::hover());
+                        ui.painter().circle_filled(rect.center(), 4.0, self.current_palette.text_accent);
+                        ui.painter().circle_filled(rect.center(), 6.0, with_alpha(self.current_palette.text_accent, 60));
+                        ui.label(egui::RichText::new("POWER").monospace().size(10.0).color(self.current_palette.text_muted));
+                    });
+                });
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                self.draw_now_playing(ui);
+
+                ui.add_space(20.0);
+
+                ui.label(egui::RichText::new("GRAPHIC EQUALIZER")
+                .color(Color32::from_rgb(150, 160, 175))
+                .monospace()
+                .size(12.0));
+                ui.add_space(8.0);
+
+                let remaining_height = ui.available_height();
+                self.draw_spectrum(ui, remaining_height);
+            });
         });
 
         ui.ctx().request_repaint();
@@ -509,38 +760,41 @@ impl eframe::App for VisualizerApp {
 
 fn main() {
     let (tx_gui, rx_gui) = mpsc::channel::<BarFrame>();
-    let (tx_meta, rx_meta) = mpsc::channel::<TrackUpdate>();
+    let (tx_mpris, rx_mpris) = mpsc::channel::<MprisMessage>(); // Using new message Enum
 
     let stream = spawn_audio_pipeline(tx_gui);
-    spawn_mpris_thread(tx_meta);
+    spawn_mpris_thread(tx_mpris);
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-        .with_inner_size([720.0, 480.0])
-        // Keep enough room for the now-playing row and a sliver of
-        // spectrum; the layout itself degrades gracefully below this too,
-        // but there's no point letting the window shrink to nothing.
-        .with_min_inner_size([220.0, 260.0]),
+        .with_inner_size([860.0, 520.0])
+        .with_min_inner_size([400.0, 340.0]),
         ..Default::default()
     };
 
     eframe::run_native(
-        "Audio Visualizer",
+        "Retro Audio Visualizer",
         options,
         Box::new(|cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
             Ok(Box::new(VisualizerApp {
                 rx_gui,
-                rx_meta,
+                rx_mpris, // Renamed
                 current_bars: [0.0; NUM_BARS],
                 peak_bars: [0.0; NUM_BARS],
                 attack_rate: ATTACK_RATE,
                 release_rate: RELEASE_RATE,
                 peak_release_rate: PEAK_RELEASE_RATE,
                 album_art: None,
+                current_palette: AppPalette::default(),
                 title: String::new(),
                         artist: String::new(),
                         album: String::new(),
+                        record_angle: 0.0,
+                        text_scroll: 0.0,
+                        is_playing: false,                   // NEW
+                        position: Duration::default(),       // NEW
+                        length: None,                        // NEW
             }))
         }),
     )
