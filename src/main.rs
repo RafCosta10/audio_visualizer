@@ -18,6 +18,8 @@ const MIN_BIN: usize = 5;
 const MAX_BIN: usize = 400;
 const MIN_DB: f32 = -60.0;
 const MAX_DB: f32 = 0.0;
+
+#[cfg(target_os = "linux")]
 const ALBUM_ART_SIZE: u32 = 160;
 
 const MIN_BAR_WIDTH: f32 = 4.0;
@@ -197,23 +199,53 @@ fn downsample_bars(bars: &BarFrame, display_count: usize) -> Vec<f32> {
 
 fn spawn_audio_pipeline(tx_gui: mpsc::Sender<BarFrame>) -> cpal::Stream {
     let host = cpal::default_host();
-    let device = host
-    .default_input_device()
-    .expect("No default input device found!");
-    let config = device.default_input_config().expect("No config found!");
 
+    // On Windows, capture the Output device (Speakers) to hear desktop audio via loopback
+    #[cfg(target_os = "windows")]
+    let (device, config) = {
+        let dev = host.default_output_device().expect("No default output device found!");
+        let cfg = dev.default_output_config().expect("No default config found!");
+        (dev, cfg)
+    };
+
+    // On Linux, capture the default Input device (Monitor)
+    #[cfg(not(target_os = "windows"))]
+    let (device, config) = {
+        let dev = host.default_input_device().expect("No default input device found!");
+        let cfg = dev.default_input_config().expect("No default config found!");
+        (dev, cfg)
+    };
+
+    // IMPORTANT (Windows fix): WASAPI loopback capture on Windows delivers
+    // stereo, interleaved buffers whose size depends on the audio engine's
+    // period -- it is essentially never exactly FFT_SIZE samples, and it is
+    // never mono. The old code assumed a mono callback of exactly FFT_SIZE
+    // samples every time, which is true on the Linux monitor-source path but
+    // false on Windows -- so `samples.len() != FFT_SIZE` was always true and
+    // every buffer was silently dropped, meaning the FFT never ran and the
+    // spectrum never moved. We downmix to mono here and accumulate into a
+    // rolling buffer so a full FFT window is assembled regardless of the
+    // device's native callback size or channel count.
+    let channels = config.channels() as usize;
     let (tx_audio, rx_audio) = mpsc::channel::<Vec<f32>>();
 
     let stream = device
-    .build_input_stream(
-        config.config(),
-                        move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                            tx_audio.send(data.to_vec()).ok();
-                        },
-                        |err| eprintln!("Audio stream error: {}", err),
-                        None,
-    )
-    .expect("Failed to build input stream!");
+        .build_input_stream(
+            config.config(),
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                let mono: Vec<f32> = if channels <= 1 {
+                    data.to_vec()
+                } else {
+                    data.chunks_exact(channels)
+                        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+                        .collect()
+                };
+                tx_audio.send(mono).ok();
+            },
+            |err| eprintln!("Audio stream error: {}", err),
+            None,
+        )
+        .expect("Failed to build input stream!");
 
     stream.play().unwrap();
 
@@ -223,17 +255,24 @@ fn spawn_audio_pipeline(tx_gui: mpsc::Sender<BarFrame>) -> cpal::Stream {
         let mut input_vec = fft.make_input_vec();
         let mut output_vec = fft.make_output_vec();
 
+        // Rolling accumulator: works no matter how big/small each device
+        // callback's buffer is (fixes Windows; also makes Linux more robust).
+        let mut acc: Vec<f32> = Vec::with_capacity(FFT_SIZE * 2);
+
         for samples in rx_audio {
-            if samples.len() != FFT_SIZE {
-                continue;
-            }
-            input_vec.copy_from_slice(&samples);
-            if fft.process(&mut input_vec, &mut output_vec).is_err() {
-                continue;
-            }
-            let bars = compute_bars(&output_vec);
-            if tx_gui.send(bars).is_err() {
-                break;
+            acc.extend_from_slice(&samples);
+
+            while acc.len() >= FFT_SIZE {
+                input_vec.copy_from_slice(&acc[..FFT_SIZE]);
+                acc.drain(..FFT_SIZE);
+
+                if fft.process(&mut input_vec, &mut output_vec).is_err() {
+                    continue;
+                }
+                let bars = compute_bars(&output_vec);
+                if tx_gui.send(bars).is_err() {
+                    return;
+                }
             }
         }
     });
@@ -241,6 +280,7 @@ fn spawn_audio_pipeline(tx_gui: mpsc::Sender<BarFrame>) -> cpal::Stream {
     stream
 }
 
+#[cfg(target_os = "linux")]
 fn load_album_art(uri: &str) -> Option<egui::ColorImage> {
     let img = if let Some(mut path_str) = uri.strip_prefix("file://") {
         if path_str.starts_with("//") {
@@ -280,25 +320,53 @@ fn load_album_art(uri: &str) -> Option<egui::ColorImage> {
     ))
 }
 
+// --- LINUX MPRIS IMPLEMENTATION ---
+//
+// mpris::PlayerFinder::find_active() is explicitly documented as "naive": it
+// does NOT check playback status, it just returns whichever player happens
+// to be enumerated first over D-Bus. If Spotify is open but stopped/paused
+// while Audacious (or anything else) is actually playing, find_active() can
+// still hand back Spotify -- which is exactly why title/artist/art went
+// blank and "nothing playing" showed up even though the spectrum was moving
+// fine (spectrum capture is system-wide loopback and doesn't go through
+// MPRIS at all, so it was never affected). We pick the player ourselves:
+// prefer one that's actually Playing, fall back to one that's Paused, and
+// otherwise treat it as nothing playing.
+#[cfg(target_os = "linux")]
+fn find_best_player(finder: &mpris::PlayerFinder) -> Option<mpris::Player<'_>> {
+    let mut players = finder.find_all().ok()?;
+    if players.is_empty() {
+        return None;
+    }
+
+    let playing_idx = players.iter().position(|p| {
+        matches!(p.get_playback_status(), Ok(mpris::PlaybackStatus::Playing))
+    });
+    let paused_idx = players.iter().position(|p| {
+        matches!(p.get_playback_status(), Ok(mpris::PlaybackStatus::Paused))
+    });
+
+    playing_idx.or(paused_idx).map(|idx| players.swap_remove(idx))
+}
+
+#[cfg(target_os = "linux")]
 fn spawn_mpris_thread(tx_mpris: mpsc::Sender<MprisMessage>) {
     thread::spawn(move || {
         let mut last_id: Option<String> = None;
         if let Ok(finder) = mpris::PlayerFinder::new() {
             loop {
-                if let Ok(player) = finder.find_active() {
-                    // 1. Send Playback State (Position, Status, Length)
+                if let Some(player) = find_best_player(&finder) {
                     let status = player.get_playback_status().unwrap_or(mpris::PlaybackStatus::Stopped);
                     let is_playing = status == mpris::PlaybackStatus::Playing;
                     let position = player.get_position().unwrap_or_default();
-
+                    
                     let metadata = player.get_metadata().ok();
                     let length = metadata.as_ref().and_then(|m| m.length());
-
+                    
                     tx_mpris.send(MprisMessage::Playback(PlaybackUpdate {
                         is_playing, position, length
                     })).ok();
 
-                    // 2. Send Track Data if the song changed
                     if let Some(metadata) = metadata {
                         let id = metadata.track_id().map(|id| id.to_string()).unwrap_or_else(|| {
                             format!("{:?}{:?}", metadata.title(), metadata.artists())
@@ -316,10 +384,168 @@ fn spawn_mpris_thread(tx_mpris: mpsc::Sender<MprisMessage>) {
                             })).ok();
                         }
                     }
+                } else if last_id.is_some() {
+                    // Nothing is Playing or Paused anymore -- clear stale info
+                    // instead of leaving the last track/art stuck on screen.
+                    last_id = None;
+                    tx_mpris.send(MprisMessage::Track(TrackUpdate {
+                        title: String::new(),
+                        artist: String::new(),
+                        album: String::new(),
+                        art: None,
+                    })).ok();
+                    tx_mpris.send(MprisMessage::Playback(PlaybackUpdate {
+                        is_playing: false,
+                        position: Duration::default(),
+                        length: None,
+                    })).ok();
                 }
-                // Fast poll for smooth progress bar updates
-                thread::sleep(Duration::from_millis(100));
+                thread::sleep(Duration::from_millis(100)); 
             }
+        }
+    });
+}
+
+// --- WINDOWS IMPLEMENTATION (GSMTC, the Windows equivalent of MPRIS) ---
+// Requires the `windows` crate with the "Media_Control", "Storage_Streams",
+// and "Foundation" features enabled for the windows target -- see the
+// Cargo.toml notes that go with this file. Verify feature names for your
+// exact `windows` crate version at https://microsoft.github.io/windows-rs/features/
+//
+// NOTE: GSMTC only knows about apps that register with Windows' System Media
+// Transport Controls (SMTC). Many Windows media apps (Spotify, foobar2000,
+// AIMP, Chrome/Edge tabs, Windows Media Player, etc.) do this automatically,
+// but plenty of others -- including stock Audacious on Windows -- do not, and
+// won't appear here at all no matter what this code does. If a particular
+// player never shows up, check whether it (or a plugin for it) supports SMTC.
+//
+// Also, like MPRIS's `find_active()`, GetCurrentSession() just returns
+// whichever session Windows currently considers "the" session -- not
+// necessarily whichever one is actually playing. We enumerate all sessions
+// ourselves and prefer one that's actually Playing (falling back to Paused)
+// instead, so an idle/stopped app can't shadow one that's really playing.
+#[cfg(target_os = "linux")]
+fn windows_best_session(
+) -> Option<windows::Media::Control::GlobalSystemMediaTransportControlsSession> {
+    use windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager as SessionManager;
+    use windows::Media::Control::GlobalSystemMediaTransportControlsSessionPlaybackStatus as PlaybackStatus;
+
+    let manager = SessionManager::RequestAsync().ok()?.get().ok()?;
+    let sessions = manager.GetSessions().ok()?;
+    let count = sessions.Size().ok()?;
+
+    let mut playing = None;
+    let mut paused = None;
+
+    for i in 0..count {
+        let Ok(session) = sessions.GetAt(i) else {
+            continue;
+        };
+        let status = session
+            .GetPlaybackInfo()
+            .ok()
+            .and_then(|info| info.PlaybackStatus().ok());
+
+        match status {
+            Some(PlaybackStatus::Playing) if playing.is_none() => playing = Some(session),
+            Some(PlaybackStatus::Paused) if paused.is_none() => paused = Some(session),
+            _ => {}
+        }
+    }
+
+    playing.or(paused)
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_mpris_thread(tx_mpris: mpsc::Sender<MprisMessage>) {
+    use windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager;
+    use windows::Storage::Streams::DataReader;
+
+    thread::spawn(move || {
+        let manager = match GlobalSystemMediaTransportControlsSessionManager::RequestAsync() {
+            Ok(op) => match op.get() {
+                Ok(m) => m,
+                Err(_) => return,
+            },
+            Err(_) => return,
+        };
+
+        let mut last_id = String::new();
+
+        loop {
+            if let Ok(session) = manager.GetCurrentSession() {
+                // 1. Get Playback Status & Position
+                if let Ok(playback) = session.GetPlaybackInfo() {
+                    let status = playback.PlaybackStatus().unwrap_or_default().0;
+                    let is_playing = status == 4; // 4 = Playing
+
+                    let mut position = Duration::default();
+                    let mut length = None;
+
+                    if let Ok(timeline) = session.GetTimelineProperties() {
+                        let position_ticks = timeline.Position().unwrap_or_default().Duration as u64;
+                        let last_updated = timeline.LastUpdatedTime().unwrap_or_default().UniversalTime as u64;
+                        
+                        // Convert Rust's SystemTime to Windows FILETIME (100-ns ticks since January 1, 1601)
+                        let unix_now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros() as u64 * 10;
+                        let win_now = unix_now + 116_444_736_000_000_000;
+                        
+                        // Add the time elapsed since the last Windows API update (only if playing!)
+                        let time_elapsed = if is_playing && win_now > last_updated {
+                            win_now - last_updated
+                        } else {
+                            0
+                        };
+                        
+                        position = Duration::from_micros((position_ticks + time_elapsed) / 10);
+                        length = Some(Duration::from_micros((timeline.EndTime().unwrap_or_default().Duration / 10) as u64));
+                    }
+
+                    tx_mpris.send(MprisMessage::Playback(PlaybackUpdate { is_playing, position, length })).ok();
+                }
+
+                // 2. Get Track Metadata & Album Art
+                if let Ok(media_props) = session.TryGetMediaPropertiesAsync().and_then(|op| op.get()) {
+                    let title = media_props.Title().unwrap_or_default().to_string();
+                    let artist = media_props.Artist().unwrap_or_default().to_string();
+                    let album = media_props.AlbumTitle().unwrap_or_default().to_string();
+
+                    let track_id = format!("{}-{}-{}", title, artist, album);
+                    if track_id != last_id {
+                        last_id = track_id;
+                        let mut art = None;
+                        
+                        // Extract Album Art from Windows Memory Stream
+                        if let Ok(thumb_ref) = media_props.Thumbnail() {
+                            if let Ok(stream) = thumb_ref.OpenReadAsync().and_then(|op| op.get()) {
+                                let size = stream.Size().unwrap_or(0) as u32;
+                                if size > 0 {
+                                    if let Ok(reader) = DataReader::CreateDataReader(&stream) {
+                                        if reader.LoadAsync(size).and_then(|op| op.get()).is_ok() {
+                                            let mut bytes = vec![0u8; size as usize];
+                                            if reader.ReadBytes(&mut bytes).is_ok() {
+                                                if let Ok(img) = image::load_from_memory(&bytes) {
+                                                    let img = img.resize_to_fill(160, 160, image::imageops::FilterType::Lanczos3);
+                                                    let rgba = img.to_rgba8();
+                                                    art = Some(egui::ColorImage::from_rgba_unmultiplied(
+                                                        [rgba.width() as usize, rgba.height() as usize],
+                                                        &rgba.into_raw(),
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        tx_mpris.send(MprisMessage::Track(TrackUpdate { title, artist, album, art })).ok();
+                    }
+                }
+            } else {
+                tx_mpris.send(MprisMessage::Playback(PlaybackUpdate { is_playing: false, position: Duration::default(), length: None })).ok();
+            }
+            thread::sleep(Duration::from_millis(500));
         }
     });
 }
@@ -560,29 +786,38 @@ impl VisualizerApp {
                 // -- Physical Custom Buttons --
                 ui.horizontal(|ui| {
                     if draw_hardware_button(ui, "⏮", &self.current_palette).clicked() {
+                        #[cfg(target_os = "linux")]
+                        std::thread::spawn(|| { if let Ok(finder) = mpris::PlayerFinder::new() { if let Ok(player) = finder.find_active() { player.previous().ok(); } } });
+                        
+                        #[cfg(target_os = "windows")]
                         std::thread::spawn(|| {
-                            if let Ok(finder) = mpris::PlayerFinder::new() {
-                                if let Ok(player) = finder.find_active() {
-                                    player.previous().ok();
-                                }
+                            use windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager;
+                            if let Ok(manager) = GlobalSystemMediaTransportControlsSessionManager::RequestAsync().and_then(|op| op.get()) {
+                                if let Ok(session) = manager.GetCurrentSession() { session.TrySkipPreviousAsync().ok(); }
                             }
                         });
                     }
                     if draw_hardware_button(ui, "⏵⏸", &self.current_palette).clicked() {
+                        #[cfg(target_os = "linux")]
+                        std::thread::spawn(|| { if let Ok(finder) = mpris::PlayerFinder::new() { if let Ok(player) = finder.find_active() { player.play_pause().ok(); } } });
+                        
+                        #[cfg(target_os = "windows")]
                         std::thread::spawn(|| {
-                            if let Ok(finder) = mpris::PlayerFinder::new() {
-                                if let Ok(player) = finder.find_active() {
-                                    player.play_pause().ok();
-                                }
+                            use windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager;
+                            if let Ok(manager) = GlobalSystemMediaTransportControlsSessionManager::RequestAsync().and_then(|op| op.get()) {
+                                if let Ok(session) = manager.GetCurrentSession() { session.TryTogglePlayPauseAsync().ok(); }
                             }
                         });
                     }
                     if draw_hardware_button(ui, "⏭", &self.current_palette).clicked() {
+                        #[cfg(target_os = "linux")]
+                        std::thread::spawn(|| { if let Ok(finder) = mpris::PlayerFinder::new() { if let Ok(player) = finder.find_active() { player.next().ok(); } } });
+                        
+                        #[cfg(target_os = "windows")]
                         std::thread::spawn(|| {
-                            if let Ok(finder) = mpris::PlayerFinder::new() {
-                                if let Ok(player) = finder.find_active() {
-                                    player.next().ok();
-                                }
+                            use windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager;
+                            if let Ok(manager) = GlobalSystemMediaTransportControlsSessionManager::RequestAsync().and_then(|op| op.get()) {
+                                if let Ok(session) = manager.GetCurrentSession() { session.TrySkipNextAsync().ok(); }
                             }
                         });
                     }
@@ -655,10 +890,11 @@ impl eframe::App for VisualizerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let dt = ui.input(|i| i.stable_dt).clamp(1.0 / 240.0, 0.1);
 
-        // ONLY spin and scroll if the music is actively playing
+        // Advance animations & SMOOTH PROGRESS BAR
         if self.is_playing {
-            self.record_angle += dt * 1.8;
-            self.text_scroll += dt * 35.0;
+            self.record_angle += dt * 1.8; 
+            self.text_scroll += dt * 35.0; 
+            self.position += Duration::from_secs_f32(dt); // Glide forward mathematically
         }
 
         let mut latest_bars = None;
@@ -666,47 +902,51 @@ impl eframe::App for VisualizerApp {
             latest_bars = Some(target_bars);
         }
         if let Some(target_bars) = latest_bars {
-            update_bars(
-                &mut self.current_bars,
-                &target_bars,
-                self.attack_rate,
-                self.release_rate,
-                dt,
-            );
+            update_bars(&mut self.current_bars, &target_bars, self.attack_rate, self.release_rate, dt);
         }
         for (peak, &current) in self.peak_bars.iter_mut().zip(self.current_bars.iter()) {
             let decayed = *peak * (-self.peak_release_rate * dt).exp();
             *peak = current.max(decayed);
         }
 
+        let mut latest_playback = None;
         while let Ok(msg) = self.rx_mpris.try_recv() {
             match msg {
                 MprisMessage::Track(update) => {
                     self.title = update.title;
                     self.artist = update.artist;
                     self.album = update.album;
-
-                    // Generate the palette right before converting to a texture!
                     if let Some(img) = &update.art {
                         self.current_palette = AppPalette::from_image(img);
                     } else {
                         self.current_palette = AppPalette::default();
                     }
-
                     self.album_art = update.art.map(|color_image| {
-                        ui.ctx().load_texture(
-                            "album_art",
-                            color_image,
-                            TextureOptions::LINEAR,
-                        )
+                        ui.ctx().load_texture("album_art", color_image, TextureOptions::LINEAR)
                     });
-                    self.text_scroll = 0.0;
+                    self.text_scroll = 0.0; 
                 }
                 MprisMessage::Playback(update) => {
-                    self.is_playing = update.is_playing;
-                    self.position = update.position;
-                    self.length = update.length;
+                    latest_playback = Some(update);
                 }
+            }
+        }
+
+        // Apply thread updates, but prevent backward UI stutters
+        if let Some(update) = latest_playback {
+            self.is_playing = update.is_playing;
+            self.length = update.length;
+            
+            // Allow the UI to glide smoothly, but if it drifts away from the accurate 
+            // background thread time by more than 1.5 seconds, snap it to the exact time.
+            let diff = if self.position > update.position {
+                self.position - update.position
+            } else {
+                update.position - self.position
+            };
+            
+            if diff.as_secs_f32() > 1.5 {
+                self.position = update.position;
             }
         }
 

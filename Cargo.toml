@@ -9,7 +9,17 @@ eframe = "0.35.0"
 egui = "0.35.0"
 realfft = "3.5.0"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-mpris = "2.0"
+base64 = "0.23.0"
+reqwest = { version = "0.13.4", features = ["blocking"] }
+urlencoding = "2.1.3"
+[target.'cfg(target_os = "linux")'.dependencies]
+mpris = "2.0" # Or whatever version you are using
 reqwest = { version = "0.13.4", features = ["blocking"] }
 base64 = "0.23.0"
 urlencoding = "2.1.3"
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = [
+    "Media_Control",
+    "Storage_Streams",
+    "Foundation",
+] }
