@@ -7,6 +7,9 @@ edition = "2024"
 cpal = "0.18.1"
 eframe = "0.35.0"
 egui = "0.35.0"
+egui-wgpu = "0.35.0"
+wgpu = "29.0"
+bytemuck = { version = "1.21", features = ["derive"] }
 realfft = "3.5.0"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 base64 = "0.23.0"
